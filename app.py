@@ -2,20 +2,28 @@ import os
 import json
 import numpy as np
 import tensorflow as tf
+import pickle
 from flask import Flask, request, jsonify
 from tensorflow.keras.preprocessing.text import tokenizer_from_json
 from tensorflow.keras.preprocessing.sequence import pad_sequences
+from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from flask_cors import CORS # Tambahkan ini untuk mengizinkan CORS
 
 app = Flask(__name__)
 CORS(app) # Mengaktifkan CORS untuk semua rute
 
 # --- Konfigurasi Path Model ---
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'sentiment', 'dummy_sentiment_model.h5')
-TOKENIZER_PATH = os.path.join(os.path.dirname(__file__), 'model', 'sentiment', 'tokenizer.json')
-LEXICON_POSITIVE_PATH = os.path.join(os.path.dirname(__file__), 'model', 'sentiment', 'lexicon_positive.json')
-LEXICON_NEGATIVE_PATH = os.path.join(os.path.dirname(__file__), 'model', 'sentiment', 'lexicon_negative.json')
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'sentiment', 'sentiment_model_lstm.h5')
+TOKENIZER_PATH = os.path.join(os.path.dirname(__file__), 'models', 'sentiment', 'tokenizer.pkl')
+WORD_INDEX_PATH = os.path.join(os.path.dirname(__file__), 'models', 'sentiment', 'word_index.json')
+LEXICON_POSITIVE_PATH = os.path.join(os.path.dirname(__file__), 'models', 'sentiment', 'lexicon_positive.json')
+LEXICON_NEGATIVE_PATH = os.path.join(os.path.dirname(__file__), 'models', 'sentiment', 'lexicon_negative.json')
+VECTORIZER_PATH = os.path.join(os.path.dirname(__file__), 'models', 'search', 'tfidf_vectorizer.pkl')
+MATRIX_PATH = os.path.join(os.path.dirname(__file__), 'models', 'search', 'tfidf_matrix.pkl')
+DATA_PATH = os.path.join(os.path.dirname(__file__), 'models', 'search', 'cbr_clean.json')
 
 # --- Global Variables for ML Assets ---
 sentiment_model = None
@@ -23,21 +31,26 @@ tokenizer = None
 lexicon_positive = {}
 lexicon_negative = {}
 stemmer = None # Sastrawi stemmer
+# --- Load Vectorizer for Search ---
+tfidf_vectorizer = None
+tfidf_matrix = None
+data = None
+stopword_remover = StopWordRemoverFactory().create_stop_word_remover()
+
 
 # --- Maximum Sequence Length for Padding (sesuaikan dengan model Anda) ---
 MAX_SEQUENCE_LENGTH = 10
 
 # --- Fungsi untuk Memuat Aset ML ---
 def load_ml_assets():
-    global sentiment_model, tokenizer, lexicon_positive, lexicon_negative, stemmer
+    global sentiment_model, tokenizer, lexicon_positive, lexicon_negative, stemmer, tfidf_vectorizer, tfidf_matrix, data
     try:
         sentiment_model = tf.keras.models.load_model(MODEL_PATH)
         print(f"Sentiment model loaded from: {MODEL_PATH}")
 
-        with open(TOKENIZER_PATH, 'r', encoding='utf-8') as f:
-            tokenizer_json = f.read()
-            tokenizer = tokenizer_from_json(tokenizer_json)
-        print(f"Tokenizer loaded from: {TOKENIZER_PATH}")
+        with open(TOKENIZER_PATH, 'rb') as f:
+            tokenizer = pickle.load(f)
+        print("Tokenizer loaded from tokenizer.pkl")
 
         with open(LEXICON_POSITIVE_PATH, 'r', encoding='utf-8') as f:
             lexicon_positive = json.load(f)
@@ -47,10 +60,24 @@ def load_ml_assets():
             lexicon_negative = json.load(f)
         print(f"Negative lexicon loaded from: {LEXICON_NEGATIVE_PATH}")
 
+        # Muat vectorizer dan matriks dari file .pkl
+        with open(VECTORIZER_PATH, 'rb') as f:
+            tfidf_vectorizer = pickle.load(f)
+        with open(MATRIX_PATH, 'rb') as f:
+            tfidf_matrix = pickle.load(f)
+        print("Model TF-IDF berhasil dimuat.")
+        # Muat data CBR
+        with open(DATA_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        print("Data Pantai berhasil dimuat.")
+        
         factory = StemmerFactory()
         stemmer = factory.create_stemmer()
         print("Sastrawi Stemmer loaded.")
 
+    except FileNotFoundError as e:
+        print(f"Error: File model atau data tidak ditemukan. Pastikan file .pkl dan CSV.")
+        print(e)
     except Exception as e:
         print(f"Error loading ML assets: {e}")
         sentiment_model = None
@@ -58,13 +85,27 @@ def load_ml_assets():
 load_ml_assets()
 
 # --- Fungsi Preprocessing ---
-slangwords = {
-    "bgt": "banget", "gak": "tidak", "yg": "yang", "bgs": "bagus",
-    "bgtu": "begitu", "kaga": "tidak", "tdk": "tidak", "jg": "juga", "udh": "sudah",
-    
-}
+def load_slangwords(file_path):
+    slangwords = {}
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            slangwords = json.load(file)  # Load JSON data
+    except Exception as e:
+        print(f"Error loading slangwords: {e}")
+    return slangwords
 
-indonesia_stopwords = ["yang", "dan", "di", "ini", "itu", "tidak", "adalah", "untuk", "dengan", "dari", "ke", "pada"]
+def load_stopwords(file_path):
+    stopwords = set()
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                stopwords.add(line.strip())
+    except Exception as e:
+        print(f"Error loading stopwords: {e}")
+    return stopwords
+
+slangwords = load_slangwords(os.path.join(os.path.dirname(__file__), 'models', 'sentiment', 'combined_slang_words.txt'))
+indonesia_stopwords = load_stopwords(os.path.join(os.path.dirname(__file__), 'models', 'sentiment', 'combined_stop_words.txt'))
 english_stopwords = ["the", "a", "an", "is", "of", "and", "to", "in", "for", "with", "on"]
 custom_stopwords = ["iya", "yaa", "gak", "nya", "na", "sih", "ku", "di", "ga", "ya", "gaa", "loh", "kah", "woi", "woii", "woy", "banget", "oke"]
 all_stopwords = set(list(indonesia_stopwords) + list(english_stopwords) + list(custom_stopwords))
@@ -90,8 +131,9 @@ def fix_slangwords(text):
     fixed_words = [slangwords.get(word, word) for word in words]
     return ' '.join(fixed_words)
 
-def tokenizing_text(text):
-    return text.split()
+def tokenizing_text(text, tokenizer):
+    sequences = tokenizer.texts_to_sequences([text])  # Mengubah teks menjadi token numerik
+    return sequences[0]  # Mengembalikan daftar token
 
 def filtering_text(words):
     return [word for word in words if word not in all_stopwords]
@@ -131,6 +173,50 @@ def analyze_sentiment():
         "confidence": float(prediction)
     })
 
+@app.route('/search-point', methods=['POST'])
+def search_point():
+    if tfidf_vectorizer is None or tfidf_matrix is None or data is None:
+        return jsonify({"error": "Model atau data belum dimuat di server."}), 500
+
+    data = request.get_json()
+    user_input = data.get('query')
+    top_n = 10  # Jumlah rekomendasi yang diinginkan
+
+    if not user_input or not isinstance(user_input, str):
+        return jsonify({"error": "Input pencarian tidak valid."}), 400
+
+    try:
+        # Opsional: Lakukan preprocessing pada input pengguna jika diperlukan
+        user_input_processed = fix_slangwords(user_input.lower())  # Mengatasi slangwords
+        tokenized = tokenizing_text(user_input_processed)  # Tokenisasi teks
+        filtered = filtering_text(tokenized)  # Menghapus stopwords
+        stemmed_text = stemming_text_func(' '.join(filtered))  # Stemming teks
+
+        # Transformasi input pengguna menjadi vektor TF-IDF
+        user_tfidf = tfidf_vectorizer.transform([user_input_processed])
+
+        # Hitung kemiripan cosine
+        cosine_sim = cosine_similarity(user_tfidf, tfidf_matrix).flatten()
+
+        # Ambil indeks top-N rekomendasi
+        top_indices = cosine_sim.argsort()[-top_n:][::-1]
+
+        # Siapkan hasil rekomendasi
+        recommendations = []
+        for i in top_indices:
+            # Pastikan index valid sebelum mengakses data
+            if 0 <= i < len(data):
+                beach_info = data[i]
+                # Tambahkan skor kemiripan ke hasil
+                beach_info['similarity_score'] = float(cosine_sim[i])  # Konversi ke float biasa
+                recommendations.append(beach_info)
+
+        return jsonify({"recommendations": recommendations})
+
+    except Exception as e:
+        print("Error saat mencari rekomendasi:", e)
+        return jsonify({"error": "Terjadi kesalahan saat memproses permintaan pencarian."}), 500
+    
 @app.route('/recommend-beach', methods=['POST'])
 def recommend_beach():
     data = request.get_json()
